@@ -5,7 +5,7 @@
 //	GET  /authorize   授权码签发（强制 PKCE S256）
 //	POST /token       授权码换令牌 / 刷新令牌轮换
 //	GET  /userinfo    受保护资源（校验签名、有效期、签发方、撤销与范围）
-//	POST /revoke      撤销访问或刷新令牌，结论可区分
+//	POST /revoke      撤销：出示刷新令牌=>会话级撤销；出示访问令牌=>单令牌撤销
 //	GET  /jwks.json   当前可用于校验的公钥集合
 //	POST /rotate      触发签名密钥轮换（本地管理接口）
 //
@@ -123,14 +123,15 @@ func (s *Server) clientAuth(r *http.Request) (store.Client, error) {
 	return c, nil
 }
 
-// issueTokens 签发访问令牌与刷新令牌，并记录 jti 以支持失效传播。
-func (s *Server) issueTokens(clientID, userID, scope, family string) (map[string]any, error) {
+// signAccessToken 在存储锁之外生成 jti 并完成 JWT 签名（CPU 密集，不持锁）。
+func (s *Server) signAccessToken(clientID, userID, scope string) (access, jti string, exp time.Time, err error) {
 	now := s.now()
-	jti, err := randString(16)
+	jti, err = randString(16)
 	if err != nil {
-		return nil, err
+		return "", "", time.Time{}, err
 	}
 	kid, priv := s.keys.SigningKey()
+	exp = now.Add(s.cfg.AccessTokenTTL)
 	claims := token.Claims{
 		Issuer:   s.cfg.Issuer,
 		Subject:  userID,
@@ -138,33 +139,53 @@ func (s *Server) issueTokens(clientID, userID, scope, family string) (map[string
 		Scope:    scope,
 		ID:       jti,
 		IssuedAt: now.Unix(),
-		Expires:  now.Add(s.cfg.AccessTokenTTL).Unix(),
+		Expires:  exp.Unix(),
 	}
-	access, err := token.NewSigner(kid, priv).Sign(claims)
+	access, err = token.NewSigner(kid, priv).Sign(claims)
 	if err != nil {
-		return nil, err
+		return "", "", time.Time{}, err
 	}
-	s.store.RecordAccessToken(family, jti, now.Add(s.cfg.AccessTokenTTL))
+	return access, jti, exp, nil
+}
 
+// newRefreshRecord 在存储锁之外生成新刷新令牌的不透明串与记录。
+func (s *Server) newRefreshRecord(clientID, userID, scope, family string) (string, *store.RefreshToken, error) {
 	refresh, err := randString(32)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	if err := s.store.CreateRefreshToken(&store.RefreshToken{
+	return refresh, &store.RefreshToken{
 		Token:     refresh,
 		ClientID:  clientID,
 		UserID:    userID,
 		Scope:     scope,
 		Family:    family,
-		ExpiresAt: now.Add(s.cfg.RefreshTokenTTL),
-	}); err != nil {
+		ExpiresAt: s.now().Add(s.cfg.RefreshTokenTTL),
+	}, nil
+}
+
+// issueTokens 签发访问令牌与刷新令牌，并记录 jti 以支持失效传播。
+// 用于授权码换发（此时会话是全新的，不存在并发撤销窗口）。
+func (s *Server) issueTokens(clientID, userID, scope, family string) (map[string]any, error) {
+	access, jti, exp, err := s.signAccessToken(clientID, userID, scope)
+	if err != nil {
+		return nil, err
+	}
+	_, next, err := s.newRefreshRecord(clientID, userID, scope, family)
+	if err != nil {
+		return nil, err
+	}
+	s.store.RecordAccessToken(family, jti, exp)
+	if err := s.store.CreateRefreshToken(next); err != nil {
+		// 会话在本次签发期间被并发撤销：访问令牌 jti 已在 RecordAccessToken
+		// 中被置为撤销，刷新令牌写入也被拒绝，整个换发失败，绝不返回有效后继令牌。
 		return nil, err
 	}
 	return map[string]any{
 		"access_token":  access,
 		"token_type":    "Bearer",
 		"expires_in":    int(s.cfg.AccessTokenTTL.Seconds()),
-		"refresh_token": refresh,
+		"refresh_token": next.Token,
 		"scope":         scope,
 	}, nil
 }
@@ -333,6 +354,10 @@ func (s *Server) grantAuthCode(w http.ResponseWriter, r *http.Request, client st
 	}
 	tokens, err := s.issueTokens(client.ID, ac.UserID, ac.Scope, family)
 	if err != nil {
+		if errors.Is(err, store.ErrStoreFull) {
+			oauthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable:capacity", "refresh token store full")
+			return
+		}
 		oauthError(w, r, http.StatusInternalServerError, "server_error", "token issuance failed")
 		return
 	}
@@ -346,8 +371,35 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request, client sto
 		oauthError(w, r, http.StatusBadRequest, "invalid_request", "refresh_token is required")
 		return
 	}
-	old, err := s.store.RotateRefreshToken(rt)
+	// 只读窥视：确认令牌存在且归属当前客户端。此步不改变状态，
+	// 权威的使用/撤销/过期判定在下面的原子提交中完成。
+	peek, err := s.store.PeekRefreshToken(rt)
 	if err != nil {
+		if errors.Is(err, store.ErrRefreshNotFound) {
+			oauthError(w, r, http.StatusBadRequest, "invalid_grant:refresh_unknown", "refresh token not found")
+			return
+		}
+		oauthError(w, r, http.StatusBadRequest, "invalid_grant", err.Error())
+		return
+	}
+	if peek.ClientID != client.ID {
+		oauthError(w, r, http.StatusBadRequest, "invalid_grant:client_mismatch", "refresh token was issued to a different client")
+		return
+	}
+	// 锁外完成 CPU 密集的 JWT 签名与随机串生成。
+	access, jti, accessExp, err := s.signAccessToken(client.ID, peek.UserID, peek.Scope)
+	if err != nil {
+		oauthError(w, r, http.StatusInternalServerError, "server_error", "token signing failed")
+		return
+	}
+	_, next, err := s.newRefreshRecord(client.ID, peek.UserID, peek.Scope, peek.Family)
+	if err != nil {
+		oauthError(w, r, http.StatusInternalServerError, "server_error", "token generation failed")
+		return
+	}
+	// 原子提交：消费旧令牌 + 写入新刷新令牌 + 登记新访问令牌 jti，
+	// 与并发刷新/会话撤销的胜负在此单锁内确定。
+	if _, err := s.store.CommitRotation(rt, next, jti, accessExp); err != nil {
 		switch {
 		case errors.Is(err, store.ErrRefreshNotFound):
 			oauthError(w, r, http.StatusBadRequest, "invalid_grant:refresh_unknown", "refresh token not found")
@@ -357,22 +409,21 @@ func (s *Server) grantRefresh(w http.ResponseWriter, r *http.Request, client sto
 			oauthError(w, r, http.StatusBadRequest, "invalid_grant:refresh_revoked", "refresh token revoked")
 		case errors.Is(err, store.ErrRefreshReused):
 			oauthError(w, r, http.StatusBadRequest, "invalid_grant:refresh_reuse_detected", "refresh token reuse detected; token family revoked")
+		case errors.Is(err, store.ErrStoreFull):
+			oauthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable:capacity", "refresh token store full")
 		default:
 			oauthError(w, r, http.StatusBadRequest, "invalid_grant", err.Error())
 		}
 		return
 	}
-	if old.ClientID != client.ID {
-		oauthError(w, r, http.StatusBadRequest, "invalid_grant:client_mismatch", "refresh token was issued to a different client")
-		return
-	}
-	tokens, err := s.issueTokens(client.ID, old.UserID, old.Scope, old.Family)
-	if err != nil {
-		oauthError(w, r, http.StatusInternalServerError, "server_error", "token issuance failed")
-		return
-	}
-	log.Printf("decision=allow endpoint=/token grant=refresh_token client=%s user=%s family_rotated", client.ID, old.UserID)
-	writeJSON(w, http.StatusOK, tokens)
+	log.Printf("decision=allow endpoint=/token grant=refresh_token client=%s user=%s family_rotated", client.ID, peek.UserID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token":  access,
+		"token_type":    "Bearer",
+		"expires_in":    int(s.cfg.AccessTokenTTL.Seconds()),
+		"refresh_token": next.Token,
+		"scope":         peek.Scope,
+	})
 }
 
 // ---------- /userinfo ----------
@@ -433,23 +484,35 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, r, http.StatusBadRequest, "invalid_request", "token is required")
 		return
 	}
-	// 先按刷新令牌处理。
-	res := s.store.RevokeRefreshToken(tok)
-	if res == store.RevokeNotFound {
-		// 再按访问令牌（JWT）处理：需验签以防伪造 jti 注入。
+	// 刷新令牌 => 会话级撤销：同一次授权链路上的全部访问令牌、
+	// 历史旧刷新令牌与任何后继刷新令牌一并失效。
+	detail := s.store.RevokeSession(tok)
+	if detail.Result == store.RevokeNotFound {
+		// 再按访问令牌（JWT）处理：需验签以防伪造 jti 注入。访问令牌的
+		// 撤销维持单令牌语义，不改变既有对外行为。
 		claims, err := token.Parse(tok, s.keys.VerifyKey, s.cfg.Issuer, s.cfg.ClockSkew, s.now())
-		if err != nil {
-			if errors.Is(err, token.ErrExpired) {
-				res = store.RevokeAlreadyInvalid
-			} else {
-				res = store.RevokeNotFound
+		switch {
+		case err == nil:
+			detail = store.RevokeDetail{
+				Result: s.store.RevokeAccessToken(claims.ID, time.Unix(claims.Expires, 0)),
+				Scope:  store.ScopeToken,
 			}
-		} else {
-			res = s.store.RevokeAccessToken(claims.ID, time.Unix(claims.Expires, 0))
+		case errors.Is(err, token.ErrExpired):
+			detail = store.RevokeDetail{Result: store.RevokeAlreadyInvalid, Scope: store.ScopeToken}
+		default:
+			detail = store.RevokeDetail{Result: store.RevokeNotFound, Scope: store.ScopeToken}
 		}
 	}
-	log.Printf("decision=revoke endpoint=/revoke result=%s", res)
-	writeJSON(w, http.StatusOK, map[string]string{"result": res.String()})
+	if detail.Result == store.RevokeUnavailable {
+		// 不静默放行、不淘汰有效记录：显式告知调用方撤销未能落账。
+		oauthError(w, r, http.StatusServiceUnavailable, "temporarily_unavailable:revocation_full", "revocation record store full")
+		return
+	}
+	log.Printf("decision=revoke endpoint=/revoke scope=%s family=%q result=%s", detail.Scope, detail.Family, detail.Result)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": detail.Result.String(),
+		"scope":  string(detail.Scope),
+	})
 }
 
 // ---------- /jwks.json 与 /rotate ----------

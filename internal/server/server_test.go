@@ -487,6 +487,321 @@ func TestRevocation(t *testing.T) {
 	}
 }
 
+// ---------- 会话级撤销 ----------
+
+func (f *fixture) revoke(t *testing.T, tok string) (int, map[string]any) {
+	t.Helper()
+	resp, err := f.client.PostForm(f.http.URL+"/revoke", url.Values{"token": {tok}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// TestSessionRevokeCurrentRefreshKillsAccessAndFutureRefresh 覆盖：
+// 用户拿当前刷新令牌撤销后，同会话已发出的访问令牌立即不可用，
+// 之后任何刷新（包括撤销成功后再换发）都被拒绝，且撤销幂等。
+func TestSessionRevokeCurrentRefreshKillsAccessAndFutureRefresh(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	access1 := tokens["access_token"].(string)
+	rt1 := tokens["refresh_token"].(string)
+
+	// 先正常轮换一次，得到新的当前刷新令牌 rt2 与新访问令牌 access2。
+	status, body := f.refresh(t, rt1)
+	if status != 200 {
+		t.Fatalf("rotate: %d %v", status, body)
+	}
+	rt2 := body["refresh_token"].(string)
+	access2 := body["access_token"].(string)
+
+	// 撤销“当前”刷新令牌：结论 revoked、作用域 session。
+	status, body = f.revoke(t, rt2)
+	if status != 200 || body["result"] != "revoked" || body["scope"] != "session" {
+		t.Fatalf("want revoked/session, got %d %v", status, body)
+	}
+	// 撤销前轮换前签发的访问令牌（旧签名密钥周期内）也被传播撤销。
+	for i, at := range []string{access1, access2} {
+		status, body = f.userinfo(t, at)
+		if status != 401 || errCode(body) != "invalid_token:revoked" {
+			t.Fatalf("access token #%d must be revoked, got %d %v", i+1, status, body)
+		}
+	}
+	// 当前刷新令牌与已被轮换掉的旧刷新令牌都不能再换发。
+	for i, rt := range []string{rt2, rt1} {
+		status, body = f.refresh(t, rt)
+		if status != 400 {
+			t.Fatalf("refresh #%d after session revoke: want 400, got %d %v", i+1, status, body)
+		}
+		if code := errCode(body); code != "invalid_grant:refresh_revoked" && code != "invalid_grant:refresh_reuse_detected" {
+			t.Fatalf("refresh #%d: want revoked/reuse, got %s", i+1, code)
+		}
+	}
+	// 重复撤销：幂等，already_invalid。
+	if _, body := f.revoke(t, rt2); body["result"] != "already_invalid" {
+		t.Fatalf("repeat revoke: want already_invalid, got %v", body)
+	}
+	// 不存在的令牌仍区分 not_found。
+	if _, body := f.revoke(t, "no-such-token"); body["result"] != "not_found" {
+		t.Fatalf("want not_found, got %v", body)
+	}
+}
+
+// TestSessionRevokeByOldRotatedRefreshKillsSuccessor 覆盖：
+// 拿“之前已经被轮换掉”的旧刷新令牌撤销，后继刷新令牌与其后的换发全部不可用。
+func TestSessionRevokeByOldRotatedRefreshKillsSuccessor(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	rt1 := tokens["refresh_token"].(string)
+	access1 := tokens["access_token"].(string)
+
+	status, body := f.refresh(t, rt1)
+	if status != 200 {
+		t.Fatalf("rotate: %d %v", status, body)
+	}
+	rt2 := body["refresh_token"].(string)
+	access2 := body["access_token"].(string)
+
+	// 出示已轮换的旧令牌撤销整个会话。
+	if _, body := f.revoke(t, rt1); body["result"] != "revoked" {
+		t.Fatalf("revoke via old token: %v", body)
+	}
+	// 后继刷新令牌 rt2 不能再换发。
+	if status, body := f.refresh(t, rt2); status != 400 || errCode(body) != "invalid_grant:refresh_revoked" {
+		t.Fatalf("successor refresh must be rejected, got %d %v", status, body)
+	}
+	// 撤销前后两张访问令牌都不可用。
+	for _, at := range []string{access1, access2} {
+		if status, body := f.userinfo(t, at); status != 401 || errCode(body) != "invalid_token:revoked" {
+			t.Fatalf("derived access must be revoked, got %d %v", status, body)
+		}
+	}
+	// 再次撤销同会话任意令牌：幂等 already_invalid。
+	if _, body := f.revoke(t, rt1); body["result"] != "already_invalid" {
+		t.Fatalf("repeat revoke old token: %v", body)
+	}
+}
+
+// TestSessionRevokeDoesNotAffectOtherSessions 覆盖会话隔离：
+// 撤销一个会话不能影响其它登录会话，即使它们共享同一签名密钥。
+func TestSessionRevokeDoesNotAffectOtherSessions(t *testing.T) {
+	f := newFixture(t, nil)
+	s1 := f.fullFlow(t, "openid profile")
+	s2 := f.fullFlow(t, "openid profile")
+	s3 := f.fullFlow(t, "openid profile")
+
+	if _, body := f.revoke(t, s1["refresh_token"].(string)); body["result"] != "revoked" {
+		t.Fatalf("revoke s1: %v", body)
+	}
+	// s1 死透：访问令牌被拒。
+	if status, body := f.userinfo(t, s1["access_token"].(string)); status != 401 || errCode(body) != "invalid_token:revoked" {
+		t.Fatalf("s1 access must be revoked, got %d %v", status, body)
+	}
+	// s2、s3 完全不受影响：访问令牌有效、可以继续轮换。
+	for i, s := range []map[string]any{s2, s3} {
+		if status, body := f.userinfo(t, s["access_token"].(string)); status != 200 {
+			t.Fatalf("session #%d access must remain valid, got %d %v", i+2, status, body)
+		}
+		if status, body := f.refresh(t, s["refresh_token"].(string)); status != 200 {
+			t.Fatalf("session #%d refresh must remain valid, got %d %v", i+2, status, body)
+		}
+	}
+}
+
+// TestSessionRevokeConcurrentWithRefreshOneOutcome 覆盖撤销与刷新并发：
+// 不能出现撤销与新令牌同时成功；结束时会话必须已死，且任何“赢家”手中的
+// 后继令牌都无法继续访问或继续刷新。
+func TestSessionRevokeConcurrentWithRefreshOneOutcome(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	rt := tokens["refresh_token"].(string)
+	access0 := tokens["access_token"].(string)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var refreshOK, refreshDenied, revokeOK, revokeAlready int
+	var winnerAccess, winnerRefresh string
+
+	round := func(n int, fn func()) {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				fn()
+			}()
+		}
+	}
+	round(8, func() {
+		status, body := f.refresh(t, rt)
+		mu.Lock()
+		defer mu.Unlock()
+		if status == 200 {
+			refreshOK++
+			winnerAccess, _ = body["access_token"].(string)
+			winnerRefresh, _ = body["refresh_token"].(string)
+		} else {
+			refreshDenied++
+		}
+	})
+	round(8, func() {
+		_, body := f.revoke(t, rt)
+		mu.Lock()
+		defer mu.Unlock()
+		switch body["result"] {
+		case "revoked":
+			revokeOK++
+		case "already_invalid":
+			revokeAlready++
+		}
+	})
+	wg.Wait()
+
+	// 显式撤销与重放检测都可能成为“杀死会话”的那一个状态转移，
+	// 但无论谁触发，都至多一次 revoked；其余全部得到 already_invalid / 400。
+	if revokeOK > 1 {
+		t.Fatalf("at most one revoke may report revoked, got %d", revokeOK)
+	}
+	if revokeOK+revokeAlready != 8 {
+		t.Fatalf("all 8 revoke attempts must settle, got revoked=%d already=%d", revokeOK, revokeAlready)
+	}
+	// 结束态唯一：最初的访问令牌一定被撤销。
+	if status, body := f.userinfo(t, access0); status != 401 || errCode(body) != "invalid_token:revoked" {
+		t.Fatalf("session must end revoked, got %d %v", status, body)
+	}
+	// 如果存在刷新赢家：它当时可能拿到 200，但最终其新访问令牌必须被撤销，
+	// 且新刷新令牌不能再换发（撤销与新令牌不能“同时存活”）。
+	if refreshOK > 0 {
+		if status, body := f.userinfo(t, winnerAccess); status != 401 || errCode(body) != "invalid_token:revoked" {
+			t.Fatalf("winner access must end revoked, got %d %v", status, body)
+		}
+		if status, body := f.refresh(t, winnerRefresh); status != 400 {
+			t.Fatalf("winner refresh must not rotate after settle, got %d %v", status, body)
+		}
+	}
+	t.Logf("outcome: refreshOK=%d refreshDenied=%d revokeOK=%d already=%d",
+		refreshOK, refreshDenied, revokeOK, revokeAlready)
+}
+
+// TestConcurrentOneRefreshManyRevokes 覆盖另一种交错：单个刷新与多个撤销竞争，
+// 无论刷新是否先赢，最终会话必须已死；赢家的新令牌不能继续存活。
+func TestConcurrentOneRefreshManyRevokes(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	rt := tokens["refresh_token"].(string)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var refreshStatus int
+	var refreshBody map[string]any
+	var revokedCount, alreadyCount int
+	start := make(chan struct{})
+
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		<-start
+		refreshStatus, refreshBody = f.refresh(t, rt)
+	}()
+	for i := 0; i < 4; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, body := f.revoke(t, rt)
+			mu.Lock()
+			defer mu.Unlock()
+			if body["result"] == "revoked" {
+				revokedCount++
+			} else {
+				alreadyCount++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if revokedCount > 1 {
+		t.Fatalf("at most one state transition to revoked, got %d", revokedCount)
+	}
+	if refreshStatus == 200 {
+		// 刷新先到的分支：响应可能已交付，但撤销随后必须覆盖其新令牌。
+		newAccess := refreshBody["access_token"].(string)
+		newRefresh := refreshBody["refresh_token"].(string)
+		if status, body := f.userinfo(t, newAccess); status != 401 || errCode(body) != "invalid_token:revoked" {
+			t.Fatalf("winner access must end revoked, got %d %v", status, body)
+		}
+		if status, body := f.refresh(t, newRefresh); status != 400 {
+			t.Fatalf("winner new refresh must be unusable, got %d %v", status, body)
+		}
+	}
+	// 原刷新令牌一定已不可用。
+	if status, body := f.refresh(t, rt); status != 400 {
+		t.Fatalf("original refresh must never work after settle, got %d %v", status, body)
+	}
+	t.Logf("refresh=%d revoked=%d already=%d", refreshStatus, revokedCount, alreadyCount)
+}
+
+// TestSessionRevokePropagatesAcrossKeyRotation 覆盖与密钥轮换的兼容：
+// 轮换签名密钥前签发且仍有效的同会话访问令牌，在会话撤销后同样被拒绝。
+func TestSessionRevokePropagatesAcrossKeyRotation(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	access := tokens["access_token"].(string)
+	rt := tokens["refresh_token"].(string)
+
+	// 先轮换签名密钥：旧访问令牌仍可校验（仅签名层面）。
+	if _, err := f.km.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := f.userinfo(t, access); status != 200 {
+		t.Fatal("old access token must verify before revocation")
+	}
+	// 撤销会话：即使是用旧密钥签发、仍在有效期内的访问令牌也必须被传播撤销。
+	if _, body := f.revoke(t, rt); body["result"] != "revoked" {
+		t.Fatalf("revoke: %v", body)
+	}
+	if status, body := f.userinfo(t, access); status != 401 || errCode(body) != "invalid_token:revoked" {
+		t.Fatalf("old-key access token of revoked session must be denied, got %d %v", status, body)
+	}
+}
+
+// TestRevokeAccessTokenStillTokenScoped 确认既有对外语义不回归：
+// 撤销访问令牌只杀该令牌（scope=token），不杀整个会话，刷新仍可用。
+func TestRevokeAccessTokenStillTokenScoped(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	access := tokens["access_token"].(string)
+	rt := tokens["refresh_token"].(string)
+
+	status, body := f.revoke(t, access)
+	if status != 200 || body["result"] != "revoked" || body["scope"] != "token" {
+		t.Fatalf("want revoked/token, got %d %v", status, body)
+	}
+	if status, body := f.userinfo(t, access); status != 401 || errCode(body) != "invalid_token:revoked" {
+		t.Fatalf("revoked access denied, got %d %v", status, body)
+	}
+	// 会话仍然存活：刷新成功并签发新的可用访问令牌。
+	rstatus, rbody := f.refresh(t, rt)
+	if rstatus != 200 {
+		t.Fatalf("session must stay alive after single token revoke, got %d %v", rstatus, rbody)
+	}
+	newAccess := rbody["access_token"].(string)
+	newRT := rbody["refresh_token"].(string)
+	if status, _ := f.userinfo(t, newAccess); status != 200 {
+		t.Fatalf("new access token after rotation must work, got %d", status)
+	}
+	// 新刷新令牌也能继续轮换。
+	if status, body := f.refresh(t, newRT); status != 200 {
+		t.Fatalf("new refresh token must rotate again, got %d %v", status, body)
+	}
+	// 重复撤销已撤销的访问令牌：already_invalid。
+	if _, body := f.revoke(t, access); body["result"] != "already_invalid" {
+		t.Fatalf("repeat access revoke: %v", body)
+	}
+}
+
 // ---------- 限流 ----------
 
 func TestRateLimit(t *testing.T) {
