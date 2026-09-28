@@ -114,13 +114,16 @@ func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	ok, reused := 0, 0
+	ok, reused, revoked := 0, 0, 0
 	for _, err := range results {
 		switch {
 		case err == nil:
 			ok++
 		case errors.Is(err, ErrRefreshReused):
 			reused++
+		case errors.Is(err, ErrRefreshRevoked):
+			// 首个重放者终止会话后，其余并发者线性化在其后，得到 revoked。
+			revoked++
 		default:
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -130,6 +133,9 @@ func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 	}
 	if reused == 0 {
 		t.Fatal("concurrent reuse must be detected")
+	}
+	if reused+revoked != len(results)-1 {
+		t.Fatalf("all losing contenders must be reuse/revoked, got %d %d", reused, revoked)
 	}
 }
 
