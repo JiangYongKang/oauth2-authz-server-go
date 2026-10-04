@@ -73,10 +73,15 @@ go run ./cmd/server -addr :8080
 - 轮换是**原子**的：旧令牌消费与后继令牌入存在存储层同一临界区完成，
   会话级撤销无法插入两步之间，因此不会产生“撤销成功后仍刷新出有效后继”。
 - 已使用的旧令牌再次被出示判定为**重放**：返回 `invalid_grant:refresh_reuse_detected`，
-  并终止整个会话（族）的全部刷新令牌与派生访问令牌（失效传播）。
+  并在会话仍存活时终止整个会话（族）的全部刷新令牌与派生访问令牌（失效传播）。
+  **重放判定无条件优先**：无论会话是否已经结束（例如先被显式撤销）、是否在并发出示，
+  已用过的令牌再次出现都给出同一个重放结论，不会改判为 `refresh_revoked`。
 - 会话终止只影响该族，其他会话不受影响。
-- 并发刷新同一令牌时**恰好一个成功**，其余被识别为重放（若会话已先被终止则为
-  `invalid_grant:refresh_revoked`）。
+- 并发刷新同一令牌时**恰好一个成功，其余失败方结论一致且确定**：全部判定为重放
+  `invalid_grant:refresh_reuse_detected`（首个重放者负责终止整族），不会出现一部分
+  报重放、另一部分报已撤销的混合结果。
+- 过期未消费的刷新令牌换发返回 `invalid_grant:refresh_expired`；已终止会话中
+  未用过的令牌换发返回 `invalid_grant:refresh_revoked`。
 
 ### 撤销语义
 
@@ -87,10 +92,21 @@ go run ./cmd/server -addr :8080
 |---|---|---|
 | `revoked` | 该会话此前存活，本次调用完成终止 | 令牌此前有效，本次撤销生效 |
 | `not_found` | 令牌不存在（或非本服务签发、已被过期清理） | 同左 |
-| `already_invalid` | 会话此前已终止（重复撤销、重放之后），幂等 | 令牌已撤销或已过期，幂等 |
+| `already_invalid` | 会话此前已终止（重复撤销、重放之后），或被点名令牌自身早已失效（已过期、未轮换却已被逐条撤销），幂等 | 令牌已撤销或已过期，幂等 |
 
-结论按**会话**而非被点名令牌的个体状态划分：即使出示的是已被轮换掉的旧刷新令牌、
-或已过期的刷新令牌，只要其会话仍存活，撤销就真实发生并返回 `revoked`。
+对刷新令牌的判定口径（恢复的历史语义）：
+
+- 出示**当前刷新令牌**、或**已被轮换掉但仍在有效期内**的旧令牌，且会话仍存活：
+  撤销真实发生，返回 `revoked`，整条授权链（含轮换后继与其派生访问令牌）立即终止；
+- 出示**早已过期**的刷新令牌（无论它是否被轮换消费过——把刷新令牌有效期设得比访问
+  令牌短，例如几秒，即可复现“刷新令牌已失效、同次登录的访问令牌仍有效”）：它**本来
+  就是无效的**，返回 `already_invalid`，**不算一次真实的会话撤销**，也**不连累同一次
+  登录中仍在有效期内的访问令牌**；
+- 出示未被轮换消费但已被逐条撤销的刷新令牌：同样返回 `already_invalid`，不级联到会话；
+- 重复撤销保持幂等；`revoked` / `not_found` / `already_invalid` 三类结论始终可区分。
+
+> 注意区分两个端点的口径：`/revoke` 对“已过期/已逐条撤销”的刷新令牌只记 `already_invalid`
+> 而不动会话；`/token`（换发）对“已被轮换消费”的令牌则一律判重放，两者互不影响。
 
 会话级撤销一次终止同一次授权链路上的全部凭据：
 
@@ -117,6 +133,23 @@ go run ./cmd/server -addr :8080
 
 会话级撤销不依赖逐条撤销记录：族终止标记 + `jti → family` 反向索引是访问令牌
 失效的最终判定依据，因此即使逐条记录容量已满，会话撤销仍然有效且不会被容量淘汰复活。
+
+### 过期 / 已失效令牌与清理、容量、密钥轮换的兼容范围
+
+- **过期优先，不误伤**：`/revoke` 对已过期刷新令牌一律返回 `already_invalid` 且不写
+  任何终止标记，因此该结论不会被过期清理或容量状态影响——令牌被清理前出示是
+  `already_invalid`，被清理后出示是 `not_found`，两种情况下同会话仍有效的访问令牌都
+  不受连累。
+- **清理不复活**：过期条目（授权码、刷新令牌、逐条访问令牌撤销记录）由后台协程定期
+  清理；会话终止标记保留到族内最后一个可能仍有效的令牌（刷新/访问）过期为止。仍有
+  有效令牌牵挂的族标记绝不提前回收，因此“撤销之后新产生的令牌仍失效”不会因清理而复活。
+- **容量不复活**：逐条撤销记录触顶时失败关闭（503），不淘汰仍有效记录；会话级撤销走
+  族标记通道，不占逐条容量，容量压力下依然完整生效。
+- **密钥轮换透明**：族标记按 `jti → family` 判定，与 JWT 用哪一代签名密钥无关；
+  轮换前签发、仍在有效期内的同会话访问令牌，在密钥轮换后仍会以 `invalid_token:revoked`
+  被拒绝（而不是 `unknown_key`）。
+- **隔离不扩散**：以上判定严格按族生效，不同用户、客户端、登录会话即使共享签名密钥
+  也互不影响。
 
 
 ## 配置项
@@ -176,6 +209,25 @@ curl -s -d "token=<REFRESH>" http://localhost:8080/revoke     # -> {"result":"re
 curl -s -d "token=<REFRESH>" http://localhost:8080/revoke     # -> {"result":"already_invalid"}
 curl -s -H "Authorization: Bearer <ACCESS_TOKEN>" http://localhost:8080/userinfo
 #    日志包含判定依据：decision=revoke scope=session family=<ID> result=revoked
+
+# 6) 回归复现一：用已过期刷新令牌撤销，不连累仍有效的访问令牌
+#    用秒级刷新 TTL 启动：AUTHZ_REFRESH_TTL=5s go run ./cmd/server -addr :8080
+#    完整走一遍授权拿 access/refresh，等 6 秒后：
+curl -s -d "token=<EXPIRED_REFRESH>" http://localhost:8080/revoke
+#    -> {"result":"already_invalid"}   （本来就无效，不是 revoked）
+curl -s -H "Authorization: Bearer <ACCESS_TOKEN>" http://localhost:8080/userinfo   # 仍 200
+
+# 7) 回归复现二：会话终止后再出示已用过的旧刷新令牌，结论仍是重放
+#    先 refresh 一次拿到 RT2，再 curl -d "token=<RT2>" /revoke 终止会话，然后重复出示 RT1：
+curl -s -u demo-client:demo-secret -d "grant_type=refresh_token&refresh_token=<RT1>" http://localhost:8080/token
+#    -> 400 invalid_grant:refresh_reuse_detected（无论撤没撤销会话，结论不变）
+
+# 8) 回归复现三：并发用同一刷新令牌换令牌，恰好一个成功，其余结论一致
+for i in $(seq 1 8); do
+  curl -s -u demo-client:demo-secret -d "grant_type=refresh_token&refresh_token=<RT>" \
+    http://localhost:8080/token &
+done; wait
+#    -> 恰好一个 200，其余全部 400 invalid_grant:refresh_reuse_detected（不夹杂 refresh_revoked）
 ```
 
 服务器日志以 `decision=allow|deny|revoke|rotate` 前缀输出每次判定的依据，
@@ -186,9 +238,19 @@ curl -s -H "Authorization: Bearer <ACCESS_TOKEN>" http://localhost:8080/userinfo
 - `internal/token`：篡改签名、过期、时钟偏移、签发方不符、未知密钥、畸形令牌；
 - `internal/keys`：轮换后历史密钥可校验、淘汰密钥拒绝、JWKS 一致性、并发轮换；
 - `internal/store`：授权码单次消费（含并发）、刷新重放族撤销、族间隔离、撤销结论区分、
-  会话级撤销（当前/已轮换旧令牌撤销后访问令牌与后继刷新全失效、幂等三态、撤销后登记的
-  令牌仍拒绝、撤销与刷新并发两种线性化顺序、容量失败关闭不复活、终止标记到期回收）；
+  会话级撤销（当前/仍有效已轮换旧令牌撤销后访问令牌与后继刷新全失效、幂等三态、撤销后登记的
+  令牌仍拒绝、撤销与刷新并发两种线性化顺序、容量失败关闭不复活、终止标记到期回收）、
+  本次回归（过期/已逐条撤销/已轮换且已过期的刷新令牌撤销返回 already_invalid 且不连累
+  同会话有效访问令牌、会话终止后重放结论不变、并发轮换失败方全部一致为重放、
+  重放终止的会话级效果与族隔离不削弱）；
 - `internal/server`：非法授权请求矩阵、PKCE 失败即作废、篡改/过期/范围不足令牌、
   密钥轮换期间旧令牌有效与淘汰后拒绝、刷新重放与失效传播、撤销三态、限流 429、
-  并发刷新恰好一次成功、撤销与刷新并发结论一致、撤销跨密钥轮换传播、撤销容量 503、
-  轮换与授权并发交错。
+  并发刷新恰好一次成功且失败方结论一致、撤销与刷新并发结论一致、撤销跨密钥轮换传播、撤销容量 503、
+  轮换与授权并发交错，以及本次三个端到端回归（秒级刷新 TTL 下撤销过期刷新不波及有效访问令牌、
+  会话终止后重放结论保持重放、并发刷新失败方结论统一）。
+
+> 测试日志可看出业务覆盖与每条用例结果：
+> `go test -race -v ./...` 中 `=== RUN`/`--- PASS` 按“授权码 / PKCE / JWT 校验 /
+> 密钥轮换 / 刷新轮换与重放 / 会话级撤销 / 过期与已失效令牌 / 容量与过期清理 / 限流”
+> 等业务分组命名；并发用例还会输出线性化顺序覆盖（race order coverage）。
+> 想看业务总览可运行 `go test -race -v ./... 2>&1 | grep -E '=== RUN|--- PASS|--- FAIL'`。

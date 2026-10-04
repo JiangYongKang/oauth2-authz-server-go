@@ -5,11 +5,14 @@
 //     重复消费返回 ErrCodeUsed，过期返回 ErrCodeExpired；
 //   - 刷新令牌轮换（RotateAtomic）是原子的：旧令牌被标记为已用与新令牌
 //     入存在同一临界区完成，撤销无法插入其间；已使用的旧令牌再次被出示时
-//     判定为重放，终止其所属会话（令牌族 family）；
+//     无条件判定为重放（无论会话是否已先终止、是否在并发出示，结论不变），
+//     会话仍存活时终止其所属会话（令牌族 family）；
 //   - 会话级撤销（RevokeSession）原子地终止整条授权链：族内全部刷新令牌、
 //     已轮换掉的旧令牌对应的后继关系、以及撤销之后才登记的派生访问令牌
 //     都不再可用；族标记是访问令牌失效的最终判定依据，不依赖可能被容量
 //     限制拒绝写入的逐条撤销记录，因此撤销状态不会因容量淘汰而“复活”；
+//     被点名令牌自身早已失效（已过期，或未被轮换消费却已被逐条撤销）时
+//     返回 already_invalid 且不终止会话，不连累同会话仍有效的访问令牌；
 //   - 所有映射的容量受配置上限约束，过期条目会被定期清理，
 //     资源占用不会无界增长。
 package store
@@ -221,8 +224,9 @@ func (s *Store) CreateRefreshToken(t *RefreshToken) error {
 }
 
 // RotateRefreshToken 原子地消费旧刷新令牌并返回其记录。
-// 若旧令牌已被使用，则判定重放并终止整个会话（令牌族）。
-// 已终止会话中的令牌返回 ErrRefreshRevoked。
+// 若旧令牌已被使用，则再次出示无条件判定为重放（ErrRefreshReused）并在会话
+// 仍存活时终止整个会话（令牌族）；会话此前已终止时结论不变（仍为重放）。
+// 未用过但所属会话已终止的令牌返回 ErrRefreshRevoked。
 //
 // 该方法只完成“消费”这一步；服务器正常刷新路径应使用 RotateAtomic，
 // 它把消费旧令牌与写入后继令牌合并为一个原子步骤，避免撤销插入窗口。
@@ -233,13 +237,14 @@ func (s *Store) RotateRefreshToken(token string) (*RefreshToken, error) {
 	if !ok {
 		return nil, ErrRefreshNotFound
 	}
-	// 已用令牌的再次出示优先判定为重放（沿用历史外部语义）；
-	// 若会话已被终止，则按已撤销处理。
+	// 已用令牌的再次出示无条件判定为重放（沿用历史外部语义）：
+	// 无论会话是否已经结束、是否在并发出示，结论都保持 ErrRefreshReused，
+	// 不会因为会话先被撤掉而换成 ErrRefreshRevoked。
+	// 会话仍存活时由重放终止整族；已终止则幂等保留终止标记。
 	if t.Used {
-		if _, dead := s.deadFamilies[t.Family]; dead {
-			return nil, ErrRefreshRevoked
+		if _, dead := s.deadFamilies[t.Family]; !dead {
+			s.terminateFamilyLocked(t.Family, "refresh_reuse", s.now())
 		}
-		s.terminateFamilyLocked(t.Family, "refresh_reuse", s.now())
 		return nil, ErrRefreshReused
 	}
 	if _, dead := s.deadFamilies[t.Family]; dead {
@@ -277,13 +282,14 @@ func (s *Store) RotateAtomic(clientID, token string, next *RefreshToken) (*Refre
 	if !ok {
 		return nil, ErrRefreshNotFound
 	}
-	// 已用令牌的再次出示优先判定为重放（沿用历史外部语义）；
-	// 若会话已被终止，则按已撤销处理。
+	// 已用令牌的再次出示无条件判定为重放（沿用历史外部语义）：
+	// 无论会话是否已经结束、是否在并发出示，结论都保持 ErrRefreshReused。
+	// 因此并发用同一刷新令牌换令牌时，除唯一的成功者外，其余请求结论一致，
+	// 不会出现一部分报重放、一部分报已撤销；首个重放者仍会终止整族。
 	if t.Used {
-		if _, dead := s.deadFamilies[t.Family]; dead {
-			return nil, ErrRefreshRevoked
+		if _, dead := s.deadFamilies[t.Family]; !dead {
+			s.terminateFamilyLocked(t.Family, "refresh_reuse", now)
 		}
-		s.terminateFamilyLocked(t.Family, "refresh_reuse", now)
 		return nil, ErrRefreshReused
 	}
 	if _, dead := s.deadFamilies[t.Family]; dead {
@@ -332,15 +338,19 @@ func (s *Store) RevokeRefreshToken(token string) RevokeResult {
 //
 // 结论按“会话”而非被点名令牌的个体状态划分：
 //   - RevokeOK：该会话此前仍然存活，本次调用完成终止
-//     （被点名的可以是当前刷新令牌、已被轮换掉的旧令牌或已过期令牌，
-//     只要会话仍存活，撤销即真实发生）；
+//     （被点名的可以是当前刷新令牌，或已被轮换掉但仍在有效期内的旧令牌——
+//     旧令牌仍代表一次存活的授权链，用它撤销即真实终止整条链）；
 //   - RevokeAlreadyInvalid：会话此前已终止（重复撤销、重放之后），幂等；
+//     或被点名令牌自身早已失效（已过期，或未被轮换消费却已被逐条撤销）——
+//     这种令牌“本来就是无效的”，不算一次真实的会话撤销，也不波及同一次
+//     登录中仍然有效的访问令牌（沿用历史口径）。过期判定优先于旧令牌撤销；
 //   - RevokeNotFound：令牌不存在（非本服务签发或已被过期清理）。
 //
 // 终止只影响该族；其它用户、客户端、登录会话即使共享签名密钥也不受影响。
 func (s *Store) RevokeSession(token string) (RevokeResult, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.now()
 	t, ok := s.refresh[token]
 	if !ok {
 		return RevokeNotFound, ""
@@ -349,7 +359,14 @@ func (s *Store) RevokeSession(token string) (RevokeResult, string) {
 	if _, dead := s.deadFamilies[family]; dead {
 		return RevokeAlreadyInvalid, family
 	}
-	s.terminateFamilyLocked(family, "revoke_session", s.now())
+	// 被点名令牌自身早已失效（已过期，或未被轮换消费但已被逐条撤销）：
+	// 它“本来就是无效的”，不终止会话、不连累同会话仍有效的访问令牌。
+	// 过期判定优先：即使是已轮换掉的旧令牌，只要它本身已经过期，出示它
+	// 同样不算一次真实的会话撤销。
+	if now.After(t.ExpiresAt) || (!t.Used && t.Revoked) {
+		return RevokeAlreadyInvalid, family
+	}
+	s.terminateFamilyLocked(family, "revoke_session", now)
 	return RevokeOK, family
 }
 

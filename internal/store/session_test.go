@@ -74,13 +74,25 @@ func TestRevokeSessionIdempotentAndDistinguishable(t *testing.T) {
 	if res, fam := s.RevokeSession("r1"); res != RevokeAlreadyInvalid || fam != "f" {
 		t.Fatalf("repeat: want already_invalid/f, got %s/%s", res, fam)
 	}
-	// 已过期令牌所属的会话仍然存活时，撤销同样真实发生（按会话结论划分）。
+	// 已过期且未被轮换消费的令牌“本来就是无效的”：不算真实撤销，
+	// 返回 already_invalid，同会话仍有效的访问令牌不受连累。
 	_ = s.CreateRefreshToken(&RefreshToken{Token: "old", Family: "f2", ExpiresAt: time.Now().Add(-time.Minute)})
-	if res, _ := s.RevokeSession("old"); res != RevokeOK {
-		t.Fatalf("expired token in live family: want revoked, got %s", res)
-	}
+	s.RecordAccessToken("f2", "jti-f2", time.Now().Add(time.Hour))
 	if res, _ := s.RevokeSession("old"); res != RevokeAlreadyInvalid {
-		t.Fatalf("second revoke of terminated session: want already_invalid, got %s", res)
+		t.Fatalf("expired token in live family: want already_invalid, got %s", res)
+	}
+	if s.IsAccessRevoked("jti-f2") {
+		t.Fatal("expired-token revoke must not kill a still-valid access token of the same login")
+	}
+	if s.DeadSessions() != 1 {
+		t.Fatalf("only family f must be dead, got %d", s.DeadSessions())
+	}
+	// 重复撤销同一过期令牌：结论稳定，仍然不影响会话。
+	if res, _ := s.RevokeSession("old"); res != RevokeAlreadyInvalid {
+		t.Fatalf("second revoke of expired token: want already_invalid, got %s", res)
+	}
+	if s.IsAccessRevoked("jti-f2") {
+		t.Fatal("repeat expired-token revoke must not kill the live access token")
 	}
 }
 

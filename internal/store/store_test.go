@@ -122,7 +122,6 @@ func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 		case errors.Is(err, ErrRefreshReused):
 			reused++
 		case errors.Is(err, ErrRefreshRevoked):
-			// 首个重放者终止会话后，其余并发者线性化在其后，得到 revoked。
 			revoked++
 		default:
 			t.Fatalf("unexpected error: %v", err)
@@ -131,11 +130,8 @@ func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("exactly one rotation must succeed, got %d", ok)
 	}
-	if reused == 0 {
-		t.Fatal("concurrent reuse must be detected")
-	}
-	if reused+revoked != len(results)-1 {
-		t.Fatalf("all losing contenders must be reuse/revoked, got %d %d", reused, revoked)
+	if reused != len(results)-1 || revoked != 0 {
+		t.Fatalf("all losing contenders must get the identical reuse verdict, got reused=%d revoked=%d", reused, revoked)
 	}
 }
 

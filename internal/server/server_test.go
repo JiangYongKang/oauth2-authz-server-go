@@ -523,6 +523,7 @@ func TestConcurrentRefreshRace(t *testing.T) {
 	var mu sync.Mutex
 	successes := 0
 	replays := 0
+	revoked := 0
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
@@ -530,10 +531,15 @@ func TestConcurrentRefreshRace(t *testing.T) {
 			status, body := f.refresh(t, rt)
 			mu.Lock()
 			defer mu.Unlock()
-			if status == 200 {
+			switch {
+			case status == 200:
 				successes++
-			} else if errCode(body) == "invalid_grant:refresh_reuse_detected" {
+			case errCode(body) == "invalid_grant:refresh_reuse_detected":
 				replays++
+			case errCode(body) == "invalid_grant:refresh_revoked":
+				revoked++
+			default:
+				t.Errorf("unexpected concurrent refresh verdict: %d %v", status, body)
 			}
 		}()
 	}
@@ -541,8 +547,9 @@ func TestConcurrentRefreshRace(t *testing.T) {
 	if successes != 1 {
 		t.Fatalf("exactly one concurrent refresh may succeed, got %d", successes)
 	}
-	if replays == 0 {
-		t.Fatal("concurrent reuse must be detected")
+	// 所有失败方必须得到一致且确定的重放结论，不允许夹杂已撤销结论。
+	if replays != 15 || revoked != 0 {
+		t.Fatalf("all losing requests must report reuse, got replays=%d revoked=%d", replays, revoked)
 	}
 }
 
