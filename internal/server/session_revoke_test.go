@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/highcumontoa/oauth2-authz-server-go/internal/config"
 )
@@ -54,9 +55,10 @@ func TestSessionRevokeCurrentRefreshKillsChain(t *testing.T) {
 	}
 }
 
-// 场景二：先正常轮换，再用“已被轮换掉的旧刷新令牌”撤销会话；
-// 轮换后新签发的访问令牌与新刷新令牌都必须失效。
-func TestSessionRevokeOldRotatedRefreshKillsSuccessor(t *testing.T) {
+// 场景二：先正常轮换，再用“已被轮换掉的旧刷新令牌”撤销——旧令牌本来就已失效，
+// 撤销是空操作（already_invalid），不波及新访问令牌与新刷新令牌；
+// 用当前有效的刷新令牌撤销才真实终止整条链。
+func TestSessionRevokeOldRotatedRefreshIsNoop(t *testing.T) {
 	f := newFixture(t, nil)
 	tokens := f.fullFlow(t, "openid profile")
 	rt1 := tokens["refresh_token"].(string)
@@ -68,22 +70,30 @@ func TestSessionRevokeOldRotatedRefreshKillsSuccessor(t *testing.T) {
 	access2 := body["access_token"].(string)
 	rt2 := body["refresh_token"].(string)
 
-	// 用已经轮换掉的旧刷新令牌撤销整个会话。
+	// 用已经轮换掉的旧刷新令牌撤销：本来就无效，不算真实撤销。
 	status, body = f.revokeForm(t, rt1)
-	if status != 200 || body["result"] != "revoked" {
-		t.Fatalf("want revoked via old refresh token, got %d %v", status, body)
+	if status != 200 || body["result"] != "already_invalid" {
+		t.Fatalf("rotated old token: want already_invalid, got %d %v", status, body)
 	}
 
-	// 轮换之后签发的访问令牌也被传播撤销。
+	// 轮换后签发的访问令牌与新刷新令牌都不受波及。
+	if status, body := f.userinfo(t, access2); status != 200 {
+		t.Fatalf("successor access token must survive no-op revoke, got %d %v", status, body)
+	}
+	status, body = f.refresh(t, rt2)
+	if status != 200 {
+		t.Fatalf("successor refresh must survive no-op revoke, got %d %v", status, body)
+	}
+	rt3 := body["refresh_token"].(string)
+
+	// 用当前有效的刷新令牌撤销：真实终止整条链。
+	status, body = f.revokeForm(t, rt3)
+	if status != 200 || body["result"] != "revoked" {
+		t.Fatalf("live token: want revoked, got %d %v", status, body)
+	}
 	status, body = f.userinfo(t, access2)
 	if status != 401 || errCode(body) != "invalid_token:revoked" {
-		t.Fatalf("successor access token must be revoked, got %d %v", status, body)
-	}
-
-	// 后继刷新令牌不能再换发。
-	status, body = f.refresh(t, rt2)
-	if status != 400 || errCode(body) != "invalid_grant:refresh_revoked" {
-		t.Fatalf("successor refresh must be unusable, got %d %v", status, body)
+		t.Fatalf("derived access token must be revoked after real revoke, got %d %v", status, body)
 	}
 }
 
@@ -106,9 +116,10 @@ func TestSessionRevokeDoesNotAffectOtherSessions(t *testing.T) {
 	}
 }
 
-// 场景四：撤销与刷新并发，结论必须可解释且终态一致：
-// 撤销先到 -> 刷新 400 refresh_revoked，没有有效后继；
-// 刷新先到 -> 刷新 200，但随后撤销终止整条链，新令牌立即失效。
+// 场景四：撤销与刷新并发，结论必须可解释且确定：
+// 撤销先到 -> 撤销 revoked，刷新 400 refresh_revoked，没有有效后继；
+// 刷新先到 -> 刷新 200，撤销此时点名的是已被消费的旧令牌，
+// 按历史口径判定 already_invalid（空操作），新令牌不受影响、可继续使用。
 func TestSessionRevokeConcurrentWithRefresh(t *testing.T) {
 	var revokedFirst, refreshFirst int
 	for iter := 0; iter < 80; iter++ {
@@ -145,23 +156,25 @@ func TestSessionRevokeConcurrentWithRefresh(t *testing.T) {
 
 		switch {
 		case refreshStatus == 400 && errCode(refreshBody) == "invalid_grant:refresh_revoked":
-			// 顺序 A：撤销先到。
+			// 顺序 A：撤销先到，真实终止会话。
 			revokedFirst++
 			if revokeBody["result"] != "revoked" {
 				t.Fatalf("iter %d: revoke-first want revoked, got %v", iter, revokeBody)
 			}
 		case refreshStatus == 200:
-			// 顺序 B：刷新先到；撤销随后终止整条链，新刷新令牌立即失效。
+			// 顺序 B：刷新先到；撤销点名已消费的旧令牌，是空操作。
 			refreshFirst++
+			if revokeBody["result"] != "already_invalid" {
+				t.Fatalf("iter %d: refresh-first revoke must be already_invalid, got %v", iter, revokeBody)
+			}
 			newAccess := refreshBody["access_token"].(string)
 			newRefresh := refreshBody["refresh_token"].(string)
-			status, b := f.refresh(t, newRefresh)
-			if status != 400 || errCode(b) != "invalid_grant:refresh_revoked" {
-				t.Fatalf("iter %d: new refresh must be revoked after racing revoke, got %d %v", iter, status, b)
+			// 新令牌不被空操作波及：访问令牌可用，刷新令牌可继续轮换。
+			if status, b := f.userinfo(t, newAccess); status != 200 {
+				t.Fatalf("iter %d: new access must survive no-op revoke, got %d %v", iter, status, b)
 			}
-			status, b = f.userinfo(t, newAccess)
-			if status != 401 || errCode(b) != "invalid_token:revoked" {
-				t.Fatalf("iter %d: new access must be revoked after racing revoke, got %d %v", iter, status, b)
+			if status, b := f.refresh(t, newRefresh); status != 200 {
+				t.Fatalf("iter %d: new refresh must survive no-op revoke, got %d %v", iter, status, b)
 			}
 		default:
 			t.Fatalf("iter %d: unexplainable race outcome %d %v", iter, refreshStatus, refreshBody)
@@ -209,5 +222,111 @@ func TestSessionRevokePropagatesAcrossKeyRotation(t *testing.T) {
 	status, body := f.userinfo(t, access)
 	if status != 401 || errCode(body) != "invalid_token:revoked" {
 		t.Fatalf("pre-rotation access token must be session-revoked, got %d %v", status, body)
+	}
+}
+
+// 回归（场景六）：刷新令牌比访问令牌先过期时，拿过期的刷新令牌去撤销，
+// 结论必须是 already_invalid（本来就无效），且同一次登录里仍然有效的
+// 访问令牌不被连累。过期令牌本身也不能再换发新令牌。
+func TestRevokeExpiredRefreshDoesNotKillLiveAccess(t *testing.T) {
+	f := newFixture(t, func(c *config.Config) {
+		c.RefreshTokenTTL = 5 * time.Second // 刷新令牌远短于访问令牌
+		c.AccessTokenTTL = time.Hour
+	})
+	tokens := f.fullFlow(t, "openid profile")
+	access := tokens["access_token"].(string)
+	rt := tokens["refresh_token"].(string)
+	// 另起一个会话，用于验证过期刷新令牌本身也无法再换发。
+	tokens2 := f.fullFlow(t, "openid profile")
+	rt2 := tokens2["refresh_token"].(string)
+
+	// 时钟前进到刷新令牌早已过期、访问令牌仍有效的时刻。
+	// 服务器与存储使用各自注入的时钟，需一并前进。
+	later := time.Now().Add(time.Minute)
+	f.srv.SetClock(func() time.Time { return later })
+	f.st.SetClock(func() time.Time { return later })
+
+	// 过期刷新令牌的撤销是空操作：本来就无效，不算真实会话撤销。
+	status, body := f.revokeForm(t, rt)
+	if status != 200 || body["result"] != "already_invalid" {
+		t.Fatalf("expired refresh token: want already_invalid, got %d %v", status, body)
+	}
+	// 同一次登录的有效访问令牌不被连累。
+	status, body = f.userinfo(t, access)
+	if status != 200 {
+		t.Fatalf("live access token must survive no-op revoke, got %d %v", status, body)
+	}
+
+	// 过期刷新令牌本身也无法再换发新令牌。
+	status, body = f.refresh(t, rt2)
+	if status != 400 || errCode(body) != "invalid_grant:refresh_expired" {
+		t.Fatalf("expired refresh token must not rotate, got %d %v", status, body)
+	}
+}
+
+// 回归（场景七）：旧刷新令牌已轮换、会话随后被终止之后，再出示已用过的
+// 旧令牌，结论仍是重放（refresh_reuse_detected），不因会话先被撤销而改判。
+func TestReplayAfterSessionTerminationStaysReused(t *testing.T) {
+	f := newFixture(t, nil)
+	tokens := f.fullFlow(t, "openid profile")
+	rt1 := tokens["refresh_token"].(string)
+
+	// 正常轮换 rt1 -> rt2，随后用仍有效的 rt2 终止整个会话。
+	status, body := f.refresh(t, rt1)
+	if status != 200 {
+		t.Fatalf("rotation: %d %v", status, body)
+	}
+	rt2 := body["refresh_token"].(string)
+	if _, body := f.revokeForm(t, rt2); body["result"] != "revoked" {
+		t.Fatalf("session revoke: %v", body)
+	}
+
+	// 已用过的 rt1 再次出现：结论仍是重放，不是“已撤销”。
+	status, body = f.refresh(t, rt1)
+	if status != 400 || errCode(body) != "invalid_grant:refresh_reuse_detected" {
+		t.Fatalf("used token after session termination must stay reuse, got %d %v", status, body)
+	}
+}
+
+// 回归（场景八）：并发用同一个刷新令牌换令牌，恰好一个成功，
+// 其余所有失败结论一致为重放（refresh_reuse_detected），
+// 不允许混入“已撤销”等第二种结论。
+func TestConcurrentRefreshFailuresAreUniformlyReplay(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		f := newFixture(t, nil)
+		tokens := f.fullFlow(t, "openid profile")
+		rt := tokens["refresh_token"].(string)
+
+		const n = 16
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var successes, replays, others int
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				status, body := f.refresh(t, rt)
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case status == 200:
+					successes++
+				case status == 400 && errCode(body) == "invalid_grant:refresh_reuse_detected":
+					replays++
+				default:
+					others++
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if successes != 1 {
+			t.Fatalf("iter %d: exactly one refresh may succeed, got %d", iter, successes)
+		}
+		if others != 0 || replays != n-1 {
+			t.Fatalf("iter %d: all losers must be replay, got replays=%d others=%d", iter, replays, others)
+		}
 	}
 }

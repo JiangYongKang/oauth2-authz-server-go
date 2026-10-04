@@ -519,21 +519,26 @@ func TestConcurrentRefreshRace(t *testing.T) {
 	tokens := f.fullFlow(t, "openid profile")
 	rt := tokens["refresh_token"].(string)
 
+	const n = 16
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	successes := 0
 	replays := 0
-	for i := 0; i < 16; i++ {
+	others := 0
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			status, body := f.refresh(t, rt)
 			mu.Lock()
 			defer mu.Unlock()
-			if status == 200 {
+			switch {
+			case status == 200:
 				successes++
-			} else if errCode(body) == "invalid_grant:refresh_reuse_detected" {
+			case errCode(body) == "invalid_grant:refresh_reuse_detected":
 				replays++
+			default:
+				others++
 			}
 		}()
 	}
@@ -541,8 +546,9 @@ func TestConcurrentRefreshRace(t *testing.T) {
 	if successes != 1 {
 		t.Fatalf("exactly one concurrent refresh may succeed, got %d", successes)
 	}
-	if replays == 0 {
-		t.Fatal("concurrent reuse must be detected")
+	// 失败方结论必须一致：全部为重放，不允许混入第二种结论。
+	if others != 0 || replays != n-1 {
+		t.Fatalf("all losers must be replay, got replays=%d others=%d", replays, others)
 	}
 }
 

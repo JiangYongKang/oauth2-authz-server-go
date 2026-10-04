@@ -34,8 +34,10 @@ func TestRevokeSessionKillsAccessAndFutureRefresh(t *testing.T) {
 	}
 }
 
-// 场景二：已轮换掉的旧刷新令牌被拿去撤销，后继令牌与派生访问令牌全失效。
-func TestRevokeSessionViaRotatedOldTokenKillsSuccessor(t *testing.T) {
+// 场景二：已轮换掉的旧刷新令牌本身就已失效，拿它去撤销不算真实撤销，
+// 不波及同会话仍有效的后继令牌与派生访问令牌（沿用逐令牌撤销的历史口径）；
+// 用当前有效的刷新令牌撤销才会真实终止整条链。
+func TestRevokeSessionViaRotatedOldTokenIsNoop(t *testing.T) {
 	s := newTestStore()
 	exp := time.Now().Add(time.Hour)
 	_ = s.CreateRefreshToken(&RefreshToken{Token: "r1", ClientID: "c", UserID: "u", Family: "sess1", ExpiresAt: exp})
@@ -47,15 +49,30 @@ func TestRevokeSessionViaRotatedOldTokenKillsSuccessor(t *testing.T) {
 	}
 	s.RecordAccessToken(old.Family, "jti-new", exp)
 
-	// 用已经轮换掉的旧令牌撤销整个会话。
-	if res, _ := s.RevokeSession("r1"); res != RevokeOK {
-		t.Fatalf("want revoked via rotated token, got %s", res)
+	// 用已经轮换掉的旧令牌撤销：本来就无效，不算真实撤销，不波及任何令牌。
+	if res, _ := s.RevokeSession("r1"); res != RevokeAlreadyInvalid {
+		t.Fatalf("rotated old token: want already_invalid, got %s", res)
 	}
-	if _, err := s.RotateAtomic("c", "r2", &RefreshToken{Token: "r3", ExpiresAt: exp}); !errors.Is(err, ErrRefreshRevoked) {
-		t.Fatalf("successor r2 must be unusable, got %v", err)
+	if s.IsAccessRevoked("jti-old") || s.IsAccessRevoked("jti-new") {
+		t.Fatal("no-op revoke must not touch derived access tokens")
+	}
+	if _, err := s.RotateAtomic("c", "r2", &RefreshToken{Token: "r3", ClientID: "c", UserID: "u", ExpiresAt: exp}); err != nil {
+		t.Fatalf("successor r2 must survive no-op revoke, got %v", err)
+	}
+
+	// 用当前有效的刷新令牌撤销：真实终止整条链，派生访问令牌全部失效。
+	if res, _ := s.RevokeSession("r3"); res != RevokeOK {
+		t.Fatalf("live token: want revoked, got %s", res)
 	}
 	if !s.IsAccessRevoked("jti-old") || !s.IsAccessRevoked("jti-new") {
-		t.Fatal("both old and new derived access tokens must be revoked")
+		t.Fatal("real session revoke must kill all derived access tokens")
+	}
+	// 终态：未使用过的族成员按撤销拒绝；已消费过的旧令牌仍按重放判定。
+	if _, err := s.RotateAtomic("c", "r3", &RefreshToken{Token: "r4", ExpiresAt: exp}); !errors.Is(err, ErrRefreshRevoked) {
+		t.Fatalf("live family member must be revoked after real revoke, got %v", err)
+	}
+	if _, err := s.RotateAtomic("c", "r2", &RefreshToken{Token: "r5", ExpiresAt: exp}); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("consumed old token must stay replay judgement, got %v", err)
 	}
 }
 
@@ -74,12 +91,23 @@ func TestRevokeSessionIdempotentAndDistinguishable(t *testing.T) {
 	if res, fam := s.RevokeSession("r1"); res != RevokeAlreadyInvalid || fam != "f" {
 		t.Fatalf("repeat: want already_invalid/f, got %s/%s", res, fam)
 	}
-	// 已过期令牌所属的会话仍然存活时，撤销同样真实发生（按会话结论划分）。
-	_ = s.CreateRefreshToken(&RefreshToken{Token: "old", Family: "f2", ExpiresAt: time.Now().Add(-time.Minute)})
-	if res, _ := s.RevokeSession("old"); res != RevokeOK {
-		t.Fatalf("expired token in live family: want revoked, got %s", res)
-	}
+	// 已过期令牌本来就无效：撤销它是空操作，不波及同族仍存活的令牌。
+	now := time.Now()
+	s.SetClock(func() time.Time { return now })
+	_ = s.CreateRefreshToken(&RefreshToken{Token: "old", Family: "f2", ExpiresAt: now.Add(time.Minute)})
+	_ = s.CreateRefreshToken(&RefreshToken{Token: "cur", ClientID: "c", Family: "f2", ExpiresAt: now.Add(time.Hour)})
+	now = now.Add(2 * time.Minute) // old 已过期但仍在存，cur 仍有效
 	if res, _ := s.RevokeSession("old"); res != RevokeAlreadyInvalid {
+		t.Fatalf("expired token: want already_invalid, got %s", res)
+	}
+	if _, err := s.RotateAtomic("c", "cur", &RefreshToken{Token: "cur2", Family: "f2", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("live family member must survive no-op revoke of expired token, got %v", err)
+	}
+	// 用仍有效的令牌撤销同一会话：真实发生，且幂等。
+	if res, _ := s.RevokeSession("cur2"); res != RevokeOK {
+		t.Fatalf("live token: want revoked, got %s", res)
+	}
+	if res, _ := s.RevokeSession("cur2"); res != RevokeAlreadyInvalid {
 		t.Fatalf("second revoke of terminated session: want already_invalid, got %s", res)
 	}
 }
@@ -126,9 +154,10 @@ func TestAccessRecordedAfterRevocationIsRejected(t *testing.T) {
 }
 
 // 并发：同一会话的撤销与刷新只能线性化为两种确定、可解释的结论之一：
-// (A) 撤销先于刷新：刷新被拒绝，后继令牌绝不入存；
-// (B) 刷新先于撤销：刷新成功，但撤销随后终止整个会话，新后继也立即失效。
-// 两种顺序下，操作全部返回后会话都不得存在任何有效派生令牌。
+// (A) 撤销先于刷新：撤销真实生效，刷新被拒绝（revoked），后继令牌绝不入存；
+// (B) 刷新先于撤销：刷新成功，撤销此时面对的已是被消费掉的旧令牌，
+//     按历史口径判定 already_invalid（空操作），新后继不受影响、可继续轮换。
+// 两种顺序对外结论都确定可解释，且都不存在“半撤销”的中间状态。
 func TestConcurrentRevokeAndRefreshConsistent(t *testing.T) {
 	var orderARevokedFirst, orderBRefreshFirst int
 	for iter := 0; iter < 500; iter++ {
@@ -164,7 +193,7 @@ func TestConcurrentRevokeAndRefreshConsistent(t *testing.T) {
 
 		switch {
 		case rotateErr != nil && revokeRes == RevokeOK:
-			// 顺序 A：撤销先到。
+			// 顺序 A：撤销先到，真实终止会话。
 			orderARevokedFirst++
 			if !errors.Is(rotateErr, ErrRefreshRevoked) {
 				t.Fatalf("iter %d: order A want revoked, got %v", iter, rotateErr)
@@ -172,23 +201,23 @@ func TestConcurrentRevokeAndRefreshConsistent(t *testing.T) {
 			if _, err := s.RefreshTokenInfo("r2"); !errors.Is(err, ErrRefreshNotFound) {
 				t.Fatalf("iter %d: order A must not store successor", iter)
 			}
-		case rotateErr == nil && revokeRes == RevokeOK:
-			// 顺序 B：刷新先到，撤销必须仍然终止整条链（含后继 r2）。
+			// 终态：会话已终止，旧令牌与任何后继都不可用。
+			if _, err := s.RotateRefreshToken("r1"); !errors.Is(err, ErrRefreshRevoked) && !errors.Is(err, ErrRefreshReused) {
+				t.Fatalf("iter %d: order A old token final state unexpected: %v", iter, err)
+			}
+		case rotateErr == nil && revokeRes == RevokeAlreadyInvalid:
+			// 顺序 B：刷新先到，撤销点名的是已被消费的旧令牌——空操作。
 			orderBRefreshFirst++
 			info, err := s.RefreshTokenInfo("r2")
-			if err != nil || !info.Revoked {
-				t.Fatalf("iter %d: order B successor must end revoked, err=%v info=%+v", iter, err, info)
+			if err != nil || info.Revoked || info.Used {
+				t.Fatalf("iter %d: order B successor must stay live, err=%v info=%+v", iter, err, info)
 			}
-			if _, err := s.RotateAtomic("c", "r2", &RefreshToken{Token: "r3", ExpiresAt: exp}); !errors.Is(err, ErrRefreshRevoked) {
-				t.Fatalf("iter %d: order B new successor must not refresh", iter)
+			// 后继仍可正常轮换（会话未被波及）。
+			if _, err := s.RotateAtomic("c", "r2", &RefreshToken{Token: "r3", ClientID: "c", UserID: "u", ExpiresAt: exp}); err != nil {
+				t.Fatalf("iter %d: order B successor must remain usable, got %v", iter, err)
 			}
 		default:
 			t.Fatalf("iter %d: non-linearizable outcome rotateErr=%v revoke=%s", iter, rotateErr, revokeRes)
-		}
-
-		// 无论哪种顺序，终态都是会话已终止，旧令牌与派生关系全部失效。
-		if _, err := s.RotateRefreshToken("r1"); !errors.Is(err, ErrRefreshRevoked) && !errors.Is(err, ErrRefreshReused) {
-			t.Fatalf("iter %d: old token final state unexpected: %v", iter, err)
 		}
 	}
 	if orderARevokedFirst == 0 || orderBRefreshFirst == 0 {
@@ -276,5 +305,95 @@ func TestDeadFamilyNotSweptWhileTokenLive(t *testing.T) {
 	s.Sweep()
 	if s.DeadSessions() != 0 {
 		t.Fatalf("family must be swept after all tokens expire, got %d", s.DeadSessions())
+	}
+}
+
+// 回归：过期刷新令牌本来就无效——撤销它是空操作（already_invalid），
+// 既不真实终止会话，也不波及同一次登录里仍然有效的访问令牌。
+// 复现条件：刷新令牌有效期短于访问令牌。
+func TestRevokeExpiredRefreshDoesNotKillLiveAccess(t *testing.T) {
+	s := newTestStore()
+	now := time.Now()
+	s.SetClock(func() time.Time { return now })
+	// 刷新令牌只活 5 秒，访问令牌活 1 小时。
+	_ = s.CreateRefreshToken(&RefreshToken{Token: "r1", ClientID: "c", UserID: "u", Family: "sess", ExpiresAt: now.Add(5 * time.Second)})
+	s.RecordAccessToken("sess", "jti-live", now.Add(time.Hour))
+
+	now = now.Add(time.Minute) // 刷新令牌早已过期，访问令牌仍有效
+	if res, _ := s.RevokeSession("r1"); res != RevokeAlreadyInvalid {
+		t.Fatalf("expired refresh token: want already_invalid, got %s", res)
+	}
+	if s.IsAccessRevoked("jti-live") {
+		t.Fatal("live access token of the same login must not be affected")
+	}
+	if s.DeadSessions() != 0 {
+		t.Fatalf("no real session termination may be recorded, got %d", s.DeadSessions())
+	}
+}
+
+// 回归：会话终止之后，再出示已轮换消费过的旧令牌，结论仍是重放
+// （ErrRefreshReused），不因会话先被撤销而改判为 revoked。
+func TestReplayAfterSessionTerminationStaysReused(t *testing.T) {
+	s := newTestStore()
+	exp := time.Now().Add(time.Hour)
+	_ = s.CreateRefreshToken(&RefreshToken{Token: "r1", ClientID: "c", UserID: "u", Family: "sess", ExpiresAt: exp})
+	// 正常轮换 r1 -> r2，随后用仍有效的 r2 终止整个会话。
+	if _, err := s.RotateAtomic("c", "r1", &RefreshToken{Token: "r2", ClientID: "c", UserID: "u", ExpiresAt: exp}); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := s.RevokeSession("r2"); res != RevokeOK {
+		t.Fatalf("want revoked, got %s", res)
+	}
+	// 已用过的 r1 再次出现：无论走哪条轮换路径，结论都是重放。
+	if _, err := s.RotateRefreshToken("r1"); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("RotateRefreshToken: want reused, got %v", err)
+	}
+	if _, err := s.RotateAtomic("c", "r1", &RefreshToken{Token: "r3", ExpiresAt: exp}); !errors.Is(err, ErrRefreshReused) {
+		t.Fatalf("RotateAtomic: want reused, got %v", err)
+	}
+	if _, err := s.RefreshTokenInfo("r3"); !errors.Is(err, ErrRefreshNotFound) {
+		t.Fatal("replayed presentation must never store a successor")
+	}
+}
+
+// 回归：并发用同一刷新令牌走原子轮换，恰好一个成功，
+// 其余全部得到一致的重放结论（不允许混入 revoked）。
+func TestConcurrentRotateAtomicLosersAllReused(t *testing.T) {
+	for iter := 0; iter < 50; iter++ {
+		s := newTestStore()
+		exp := time.Now().Add(time.Hour)
+		_ = s.CreateRefreshToken(&RefreshToken{Token: "r1", ClientID: "c", UserID: "u", Family: "f", ExpiresAt: exp})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var errs []error
+		start := make(chan struct{})
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				next := &RefreshToken{Token: fmt.Sprintf("r-next-%d", i), ClientID: "c", UserID: "u", ExpiresAt: exp}
+				_, err := s.RotateAtomic("c", "r1", next)
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		ok, reused := 0, 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrRefreshReused):
+				reused++
+			default:
+				t.Fatalf("iter %d: loser must be reuse, got %v", iter, err)
+			}
+		}
+		if ok != 1 || reused != len(errs)-1 {
+			t.Fatalf("iter %d: want 1 success + %d reuse, got %d/%d", iter, len(errs)-1, ok, reused)
+		}
 	}
 }
